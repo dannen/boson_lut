@@ -157,7 +157,7 @@ def apply_lut(frame, lut_name):
     return colored_frame
 
 
-def capture_and_process_video(cap, lut_var, recording_var, out_var, frame_width, frame_height, video_label, record_button, flip_horizontal_var, flip_vertical_var, exit_event):
+def capture_and_process_video(cap, lut_var, recording_var, out_var, frame_width, frame_height, video_label, record_button, flip_horizontal_var, flip_vertical_var, exit_event, rotate_var):
     """Captures video frames, applies the LUT, and handles recording and screenshots."""
     global screenshot_requested
     last_frame = None
@@ -180,6 +180,16 @@ def capture_and_process_video(cap, lut_var, recording_var, out_var, frame_width,
                         frame = cv2.flip(frame, 1)
             if flip_vertical_var.get():
                             frame = cv2.flip(frame, 0)
+            # --- Rotate image ---
+            rotation_value = rotate_var.get()
+            if rotation_value == "90":
+                frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            elif rotation_value == "180":
+                frame = cv2.rotate(frame, cv2.ROTATE_180)
+            elif rotation_value == "270":
+                frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            # --- End rotation ---
+
             colored_frame = apply_lut(frame, current_lut)
         except ValueError as e:
             print(f"Error applying LUT: {e}")
@@ -358,6 +368,14 @@ def main(lut_name, camera_type='BOSON'):
     flip_vertical_var = tk.BooleanVar()
     Button(control_frame, text="Flip Horizontal", command=lambda: flip_horizontal_var.set(not flip_horizontal_var.get())).pack(side="left", padx=5)
     Button(control_frame, text="Flip Vertical", command=lambda: flip_vertical_var.set(not flip_vertical_var.get())).pack(side="left", padx=5)
+    
+    # --- Rotation controls ---
+    rotate_var = StringVar(root)
+    rotate_var.set("0")  # Default no rotation
+    rotate_options = ["0", "90", "180", "270"]
+    Label(control_frame, text="Rotation:").pack(side="left", padx=5) 
+    rotate_menu = OptionMenu(control_frame, rotate_var, *rotate_options)
+    rotate_menu.pack(side="left", padx=5)
 
     # LUT selection dropdown
     lut_var = StringVar(root)
@@ -381,7 +399,7 @@ def main(lut_name, camera_type='BOSON'):
         global exit_event
 
         capture_thread = threading.Thread(target=capture_and_process_video, args=(
-            cap, lut_var, recording_var, out_var, frame_width, frame_height, video_label, record_button, flip_horizontal_var, flip_vertical_var, exit_event))
+            cap, lut_var, recording_var, out_var, frame_width, frame_height, video_label, record_button, flip_horizontal_var, flip_vertical_var, exit_event, rotate_var))
         capture_thread.daemon = True
         capture_thread.start()
 
