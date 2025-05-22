@@ -84,7 +84,7 @@ CONFIG_FILE = 'thermal_config.json'
 # Thread Locks
 cap_lock = threading.Lock()
 out_lock = threading.Lock()
-recording_lock = threading.Lock()
+recording_lock = threading.RLock()
 screenshot_lock = threading.Lock() # Lock for screenshot_requested
 
 update_display_call_count = 0
@@ -436,8 +436,41 @@ def capture_and_process_video(cap, lut_var, recording_var, out_var, frame_width,
         # Recording and Screenshot (use colored_bgr_frame for consistency)
         with recording_lock: 
             if recording_var[0] and out_var[0] is not None:
+                frame_to_write = colored_bgr_frame
+                h_rot, w_rot = colored_bgr_frame.shape[:2]
+
+                # frame_width and frame_height are the dimensions VideoWriter expects.
+                # If rotated frame dimensions (w_rot, h_rot) differ from VideoWriter's (frame_width, frame_height),
+                # we need to place the rotated frame onto a canvas of the correct size.
+                if (w_rot != frame_width or h_rot != frame_height):
+                    if DEBUG_MODE:
+                        print(f"DEBUG CAPTURE: Rotated frame dim ({w_rot}x{h_rot}) differs from VideoWriter dim ({frame_width}x{frame_height}). Creating canvas.")
+                    
+                    # Create a black canvas of the VideoWriter's expected dimensions
+                    # Note: VideoWriter uses (width, height), OpenCV uses (height, width, channels) for np.zeros
+                    canvas = np.zeros((frame_height, frame_width, 3), dtype=np.uint8)
+
+                    # Calculate new dimensions for the rotated frame to fit onto the canvas while maintaining aspect ratio
+                    aspect_ratio_rotated = w_rot / h_rot
+                    target_w = frame_width
+                    target_h = int(target_w / aspect_ratio_rotated)
+
+                    if target_h > frame_height:
+                        target_h = frame_height
+                        target_w = int(target_h * aspect_ratio_rotated)
+                    
+                    resized_rotated_frame = cv2.resize(colored_bgr_frame, (target_w, target_h))
+
+                    # Calculate top-left position to center the resized frame on the canvas
+                    x_offset = (frame_width - target_w) // 2
+                    y_offset = (frame_height - target_h) // 2
+
+                    # Place the resized frame onto the canvas
+                    canvas[y_offset:y_offset + target_h, x_offset:x_offset + target_w] = resized_rotated_frame
+                    frame_to_write = canvas
+                
                 try:
-                    out_var[0].write(colored_bgr_frame) # Video writers usually expect BGR
+                    out_var[0].write(frame_to_write) # Write the (potentially adjusted) frame
                 except Exception as e_write:
                     print(f"Error writing frame to video: {e_write}")
                     print("Stopping recording due to writing error.")
