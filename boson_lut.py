@@ -85,6 +85,13 @@ AMPBANK_PRODUCT_ID = '4321' # Ampbank product ID
 
 CONFIG_FILE = 'thermal_config.json'
 
+# name: (codec, in colour, file name suffix). Grayscale recordings can get a LUT later with apply_lut.py.
+RECORD_FORMATS = {
+    'Colour': ('XVID', True, ''),
+    'Grayscale': ('XVID', False, '-gray'),
+    'Grayscale lossless': ('FFV1', False, '-gray-lossless'),
+}
+
 # Thread Locks
 cap_lock = threading.Lock()
 out_lock = threading.Lock()
@@ -105,15 +112,16 @@ frame_queue = queue.Queue(maxsize=1) # Queue to safely pass frames to the main t
 current_camera_type = None # Variable to store the current camera type string (e.g., 'BOSON')
 current_display_delay_ms = 100 # Default to 100ms (10 FPS) initially
 recording_frame_size = None # (width, height) of the video being recorded; guarded by recording_lock
+recording_in_colour = True # Whether the video being recorded has the LUT applied; guarded by recording_lock
 
 # Helper Functions
 
-def load_custom_luts():
-    """Scans the current working directory for .lut files and loads them into the LUTS dictionary."""
-    for filename in os.listdir('.'):
+def load_custom_luts(directory='.', quiet=False):
+    """Scans a directory for .lut files and loads them into the LUTS dictionary."""
+    for filename in os.listdir(directory):
         if filename.endswith('.lut'):
             try:
-                with open(filename, 'r') as f:
+                with open(os.path.join(directory, filename), 'r') as f:
                     lut_data = f.read().strip()
                     try:
                         if lut_data.startswith('[') and lut_data.endswith(']'):
@@ -122,7 +130,7 @@ def load_custom_luts():
                                 lut_name = os.path.splitext(filename)[0]
                                 lut_array = np.array(lut_values, dtype=np.uint8).reshape((256, 1, 3))
                                 LUTS[lut_name] = lut_array
-                                print(f"Loaded custom LUT: {lut_name}")
+                                if not quiet: print(f"Loaded custom LUT: {lut_name}")
                             else:
                                 print(f"Invalid format in LUT file: {filename}. Expected a list of 3-tuple colors.")
                         else:
@@ -461,7 +469,8 @@ def capture_and_process_video(cap, lut_var, recording_var, out_var, frame_width,
         with recording_lock: 
             if recording_var[0] and out_var[0] is not None:
                 try:
-                    out_var[0].write(fit_frame_to_size(colored_bgr_frame, *recording_frame_size)) # Video writers usually expect BGR
+                    frame_to_record = colored_bgr_frame if recording_in_colour else processed_gray_frame
+                    out_var[0].write(fit_frame_to_size(frame_to_record, *recording_frame_size)) # Video writers usually expect BGR
                 except Exception as e_write:
                     print(f"Error writing frame to video: {e_write}")
                     print("Stopping recording due to writing error.")
@@ -946,7 +955,7 @@ def fit_frame_to_size(frame, width, height):
     scale = min(width / frame_width, height / frame_height)
     new_width = max(1, round(frame_width * scale))
     new_height = max(1, round(frame_height * scale))
-    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas = np.zeros((height, width) + frame.shape[2:], dtype=np.uint8)
     left = (width - new_width) // 2
     top = (height - new_height) // 2
     canvas[top:top + new_height, left:left + new_width] = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
@@ -957,15 +966,16 @@ def fit_frame_to_size(frame, width, height):
 def toggle_recording(recording_var, out_var, record_button_widget, original_button_bg,
                      frame_width, frame_height,
                      current_desired_capture_fps, # <<< New parameter
-                     root):
+                     root, record_format='Colour'):
     """Starts or stops recording and changes the record button color."""
-    global recording_frame_size
+    global recording_frame_size, recording_in_colour
     with recording_lock: # Assuming recording_lock is a global threading.Lock
         if not recording_var[0]:
             # Start recording
             now = datetime.datetime.now()
-            output_file = f"flir-{now.strftime('%M%H%S-%d%m%y')}.avi"
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            codec, in_colour, file_suffix = RECORD_FORMATS[record_format]
+            output_file = f"flir{file_suffix}-{now.strftime('%M%H%S-%d%m%y')}.avi"
+            fourcc = cv2.VideoWriter_fourcc(*codec)
             try:
                 if frame_width <= 0 or frame_height <= 0:
                     print(f"Error: Invalid frame dimensions for recording: {frame_width}x{frame_height}")
@@ -976,7 +986,7 @@ def toggle_recording(recording_var, out_var, record_button_widget, original_butt
                 fps_for_writer = float(current_desired_capture_fps) if current_desired_capture_fps > 0 else 20.0 
                 print(f"DEBUG TOGGLE_RECORDING: Starting video writer for {output_file} with FPS: {fps_for_writer}, Dimensions: {frame_width}x{frame_height}")
 
-                out_var[0] = cv2.VideoWriter(output_file, fourcc, fps_for_writer, (frame_width, frame_height))
+                out_var[0] = cv2.VideoWriter(output_file, fourcc, fps_for_writer, (frame_width, frame_height), isColor=in_colour)
                 if not out_var[0].isOpened():
                     print(f"Error: Could not open video writer for {output_file}. Check codecs and parameters.")
                     out_var[0] = None
@@ -989,6 +999,7 @@ def toggle_recording(recording_var, out_var, record_button_widget, original_butt
                 return recording_var[0], out_var[0]
             
             recording_frame_size = (frame_width, frame_height)
+            recording_in_colour = in_colour
             recording_var[0] = True
             print(f"Started recording to {output_file}")
             if root and record_button_widget:
@@ -1103,13 +1114,14 @@ def load_config():
         print(f"Configuration file {CONFIG_FILE} not found. Using default settings.")
         return {} # Return empty config if file doesn't exist
 
-def save_config(lut_name, camera_device, flip_state, rotate_state):
+def save_config(lut_name, camera_device, flip_state, rotate_state, record_format='Colour'):
     """Saves current configuration to the JSON file."""
     config = {
         'lut_name': lut_name,
         'camera_device': camera_device,
         'flip_state': flip_state,
-        'rotate_state': rotate_state
+        'rotate_state': rotate_state,
+        'record_format': record_format
     }
     try:
         with open(CONFIG_FILE, 'w') as f:
@@ -1532,7 +1544,7 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
     record_button.config(command=lambda: toggle_recording(
         recording_var, out_var, record_button, original_button_bg,
         *rotated_size(frame_width, frame_height, rotate_var.get()), desired_capture_fps, # Pass current values from main's scope
-        root
+        root, record_format_var.get()
     ))
     record_button.pack(side="left", padx=5)
 
@@ -1574,8 +1586,12 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
     # Action Buttons Frame
     action_button_frame = Frame(root)
     action_button_frame.pack(pady=5, padx=10, fill=tk.X)
+    initial_record_format = config.get('record_format', 'Colour')
+    record_format_var = StringVar(root, initial_record_format if initial_record_format in RECORD_FORMATS else 'Colour')
+    Label(action_button_frame, text="Record as:").pack(side="left", padx=(0, 5))
+    OptionMenu(action_button_frame, record_format_var, *RECORD_FORMATS).pack(side="left", padx=(0, 10))
     Button(action_button_frame, text="Save Config", command=lambda: save_config(
-        lut_var.get(), current_camera_index_node, flip_var.get(), rotate_var.get()
+        lut_var.get(), current_camera_index_node, flip_var.get(), rotate_var.get(), record_format_var.get()
     )).pack(side="left", padx=5)
     Button(action_button_frame, text="Exit Program", command=lambda: exit_program(cap, out_var)).pack(side="left", padx=5)
     calibrate_button = Button(action_button_frame, text="Calibrate", command=calibrate_now, state=tk.DISABLED)

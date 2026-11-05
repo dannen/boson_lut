@@ -58,10 +58,20 @@ This command starts with the `RAINBOW` LUT and treats the Lepton as a Lepton 2.
   - Calibrate a Boson on demand.
   - Save the current LUT, camera, flip and rotation to `thermal_config.json` in the current directory.
   - Exit the application.
+- **Recording Formats**: The **Record as** menu applies to the next recording. **Colour** records the picture with its LUT, which can't be cleanly changed later. **Grayscale** records the picture before the LUT, in small lossy files. **Grayscale lossless** does the same with no loss, but a 640x512 camera at 60 fps writes about 10 MB/s, and not every OpenCV build includes its FFV1 codec. The file names contain `-gray` or `-gray-lossless`.
 - **Recording**: A recording keeps the size the picture had when it started. If the rotation or camera changes during a recording, the picture is scaled to fit that size, with black bars.
 - **Boson Calibration**: By default a Boson recalibrates itself periodically (flat field correction, or FFC), which freezes the picture for about 0.4 seconds and shifts its brightness, including in recordings. While this program runs, it turns that off, calibrates once at startup, and leaves further calibrations to the **Calibrate** button. A message appears when the camera recommends calibrating, which it does once its temperature or time threshold is reached. The picture can degrade if you don't. On exit, the camera goes back to the mode it was in, and the setting is never saved to the camera's flash. Calibrating during a recording shows up in the video.
 - **Camera Settings** (Boson): This window shows sensor and core temperature, overheat events, time and temperature change since the last calibration, picture levels and the motion count. It also controls gain, contrast, zoom, the noise filters, the camera's on-screen icons and picture freeze. Changing gain also calibrates, because the picture is badly miscalibrated otherwise. **Reset** and exiting the program restore the original settings, and nothing is saved to the camera's flash. Levels and the motion count are in the camera's own units, not temperatures.
 - **Custom LUTs**: Besides the isotherm LUTs (`ISOTHERM_RED`, `ISOTHERM_GREEN` and `ISOTHERM_BLUE`), the script loads `.lut` files from the current directory. Each file holds a list of 256 `(B, G, R)` tuples.
+
+## Applying a LUT to a Recording
+`apply_lut.py` makes a colour copy of a grayscale recording:
+```sh
+python apply_lut.py flir-gray-123456-010126.avi ironblack
+```
+This command writes `flir-gray-123456-010126-ironblack.avi` beside the original. The LUT can be any built-in one or a `.lut` file in the script's folder or the current directory. Use `--lossless` to write FFV1 instead of XVID, `-o FILE` to choose the output file, `--overwrite` to replace an existing output file, and `--force` to process a video that doesn't look grayscale.
+
+Only the palette can be fully changed afterwards: the camera has already reduced its contrast to 256 levels, so set the contrast before recording. LUTs whose colours change quickly with brightness, such as the `colorwheel` ones, show **Grayscale** compression errors much more strongly, so use **Grayscale lossless** for those.
 
 ## Set USB Permissions
 We faced an issue with the application not having permission to access the FLIR Boson USB device. To resolve this, we updated udev rules:
