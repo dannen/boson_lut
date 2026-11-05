@@ -533,12 +533,47 @@ class BosonControl:
     SET_FFC_MODE = 0x00050012
     GET_FFC_MODE = 0x00050013
     GET_FFC_DESIRED = 0x00050055
+    GET_FFC_STATUS = 0x00050054
+    FFC_IN_PROGRESS = 2
+    GET_FFC_TIME_THRESHOLD = 0x0005000B
+    GET_FFC_TEMP_THRESHOLD = 0x00050009
+    GET_LAST_FFC_FRAME = 0x0005005D
+    GET_LAST_FFC_TEMP = 0x0005005E
+    GET_FRAME_COUNT = 0x00020002
+    GET_SENSOR_TEMP = 0x00050031
+    GET_CORE_TEMP = 0x00050068
+    GET_OVER_TEMP_COUNT = 0x00050076
+    GET_MOTION_COUNT = 0x000A0009
+    GET_MOTION_THRESHOLD = 0x000A000F
+    GET_MAX_ZOOM = 0x000D0001
+    GET_STATS_FIRST = 0x001D0005
+    GET_STATS_LAST = 0x001D0006
+    GET_STATS_MEAN = 0x001D0007
+    GET_STATS_FIRST_IN_ROI = 0x001D0008
+    GET_STATS_LAST_IN_ROI = 0x001D0009
+    GET_STATS_MEAN_IN_ROI = 0x001D000A
+    GAIN_MODES = {'High': 0, 'Low': 1, 'Auto': 2}
+    # name: (get function, set function, struct format). All are held in the camera's RAM only.
+    SETTINGS = {
+        'gain': (0x00050015, 0x00050014, 'I'),
+        'temporal_filter': (0x000A0002, 0x000A0001, 'I'),
+        'column_filter': (0x00080002, 0x00080001, 'I'),
+        'spatial_filter': (0x000C0002, 0x000C0001, 'I'),
+        'agc_linear': (0x00090004, 0x00090003, 'f'),
+        'agc_max_gain': (0x0009000A, 0x00090009, 'f'),
+        'agc_roi': (0x00090021, 0x00090020, 'HHHH'),
+        'stats_roi': (0x001D0004, 0x001D0003, 'HHHH'),
+        'zoom': (0x000D0003, 0x000D0002, 'III'),
+        'freeze': (0x000E0002, 0x000E0001, 'I'),
+        'icons': (0x00140020, 0x00140000, 'I'),
+    }
     STUFFED_BYTES = {0x8E: b'\x9E\x81', 0x9E: b'\x9E\x91', 0xAE: b'\x9E\xA1'}
     UNSTUFFED_BYTES = {0x81: 0x8E, 0x91: 0x9E, 0xA1: 0xAE}
 
     def __init__(self, port):
         self.sequence = 0
         self.previous_ffc_mode = None
+        self.saved_settings = {}
         self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         try:
             tty.setraw(self.fd)
@@ -607,11 +642,57 @@ class BosonControl:
             return reply
         raise TimeoutError(f"No reply to command {function_id:#010x}")
 
-    def _read_uint32(self, function_id):
+    def read(self, function_id, value_format):
         reply = self._call(function_id)
-        if len(reply) != 4:
+        size = struct.calcsize('>' + value_format)
+        if len(reply) < size:
             raise BosonControlError(f"Unexpected reply length from command {function_id:#010x}")
-        return struct.unpack('>I', reply)[0]
+        values = struct.unpack('>' + value_format, reply[:size])
+        return values[0] if len(values) == 1 else values
+
+    def _read_uint32(self, function_id):
+        return self.read(function_id, 'I')
+
+    def get_setting(self, name):
+        get_function, _, value_format = self.SETTINGS[name]
+        return self.read(get_function, value_format)
+
+    def set_setting(self, name, *values):
+        _, set_function, value_format = self.SETTINGS[name]
+        self._call(set_function, struct.pack('>' + value_format, *values))
+
+    def wait_until_settled(self, quiet_time=0.4, timeout=3.0):
+        """Waits out an FFC or gain change. During those, the camera reports the picture as frozen and its
+        noise filters as off, sometimes before its FFC status shows anything, so those can't be trusted yet."""
+        deadline = time.time() + timeout
+        quiet_since = time.time()
+        last_state = None
+        while time.time() < deadline:
+            state = (self.read(self.GET_FFC_STATUS, 'i'), self.get_setting('freeze'), self.get_setting('temporal_filter'),
+                     self.get_setting('column_filter'), self.get_setting('spatial_filter'))
+            if state != last_state or state[0] == self.FFC_IN_PROGRESS:
+                last_state = state
+                quiet_since = time.time()
+            elif time.time() - quiet_since >= quiet_time:
+                return
+            time.sleep(0.01)
+
+    def save_settings(self):
+        """Remembers the settings this program can change. Ones the camera doesn't support are skipped."""
+        self.saved_settings = {}
+        for name in self.SETTINGS:
+            try:
+                self.saved_settings[name] = self.get_setting(name)
+            except BosonControlError as e:
+                print(f"Boson setting '{name}' is not available: {e}")
+
+    def restore_settings(self):
+        self.wait_until_settled()
+        changed_gain = 'gain' in self.saved_settings and self.get_setting('gain') != self.saved_settings['gain']
+        for name, value in self.saved_settings.items():
+            self.set_setting(name, *(value if isinstance(value, tuple) else (value,)))
+        if changed_gain:
+            self.run_ffc() # The picture is badly miscalibrated after a gain change until the next FFC
 
     def get_ffc_mode(self):
         return self._read_uint32(self.GET_FFC_MODE)
@@ -652,7 +733,9 @@ def start_manual_calibration(video_device_node):
         raise BosonControlError(f"No control port found for {video_device_node}")
     control = BosonControl(port)
     try:
+        control.wait_until_settled()
         control.previous_ffc_mode = control.get_ffc_mode()
+        control.save_settings()
         control.set_ffc_mode(BosonControl.FFC_MANUAL)
         control.run_ffc()
     except Exception:
@@ -663,14 +746,188 @@ def start_manual_calibration(video_device_node):
 
 
 def stop_manual_calibration(control):
-    """Puts the camera back in the calibration mode it had and closes the port."""
+    """Puts the camera back in the state it had and closes the port."""
     try:
+        control.restore_settings()
         if control.previous_ffc_mode is not None:
             control.set_ffc_mode(control.previous_ffc_mode)
     except (OSError, BosonControlError) as e:
         print(f"Warning: could not restore the Boson's calibration mode: {e}")
     finally:
         control.close()
+
+
+class CameraSettingsWindow:
+    """Readouts and picture controls for a Boson, in a window of their own."""
+    POLL_MS = 1000
+
+    def __init__(self, root, get_control):
+        self.get_control = get_control
+        self.first_frame_sample = None
+        self.window = tk.Toplevel(root)
+        self.window.title("Camera Settings")
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        self.closed = False
+        self.readouts = {}
+        self.setting_vars = {}
+
+        readout_frame = tk.LabelFrame(self.window, text="Readouts")
+        readout_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=4)
+        for row, name in enumerate(("Sensor temperature", "Core temperature", "Overheat events", "Time since calibration",
+                                    "Temperature change since calibration", "Picture levels (low / high / mean)", "Motion count")):
+            Label(readout_frame, text=name + ":", anchor="w").grid(row=row, column=0, sticky="w", padx=4)
+            self.readouts[name] = Label(readout_frame, text="-", anchor="w", width=36)
+            self.readouts[name].grid(row=row, column=1, sticky="w", padx=4)
+
+        picture_frame = tk.LabelFrame(self.window, text="Picture")
+        picture_frame.grid(row=1, column=0, rowspan=2, sticky="nsew", padx=(8, 4), pady=4)
+        self.gain_var = StringVar(self.window)
+        self._menu(picture_frame, 0, "Gain", self.gain_var, list(BosonControl.GAIN_MODES), self.set_gain)
+        self.contrast_region_var = StringVar(self.window, "Whole picture")
+        self._menu(picture_frame, 1, "Contrast region", self.contrast_region_var, ["Whole picture", "Centre"], lambda v: self.set_region('agc_roi', v))
+        self.readout_region_var = StringVar(self.window, "Whole picture")
+        self._menu(picture_frame, 2, "Levels region", self.readout_region_var, ["Whole picture", "Centre"], lambda v: self.set_region('stats_roi', v))
+        self.linear_scale = self._scale(picture_frame, 3, "Contrast linearity (%)", 0, 100, 1, lambda v: self.send(lambda c: c.set_setting('agc_linear', float(v))))
+        self.max_gain_scale = self._scale(picture_frame, 4, "Contrast max gain", 0.1, 8, 0.01, lambda v: self.send(lambda c: c.set_setting('agc_max_gain', float(v))))
+        self.zoom_scale = self._scale(picture_frame, 5, "Zoom", 0, 49, 1, self.set_zoom)
+
+        switch_frame = tk.LabelFrame(self.window, text="Switches")
+        switch_frame.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=4)
+        for row, (name, text) in enumerate((('temporal_filter', "Temporal noise filter"), ('column_filter', "Column noise filter"),
+                                            ('spatial_filter', "Spatial noise filter"), ('icons', "Camera's on-screen icons"), ('freeze', "Freeze picture"))):
+            variable = tk.IntVar(self.window)
+            self.setting_vars[name] = variable
+            tk.Checkbutton(switch_frame, text=text, variable=variable, anchor="w",
+                           command=lambda n=name, v=variable: self.send(lambda c: c.set_setting(n, v.get()))).grid(row=row, column=0, sticky="w", padx=4)
+
+        bottom_frame = Frame(self.window)
+        bottom_frame.grid(row=2, column=1, sticky="ew", padx=(4, 8), pady=4)
+        Button(bottom_frame, text="Reset", command=self.reset).pack(side="left")
+        self.message = Label(bottom_frame, text="", fg="red", anchor="w")
+        self.message.pack(side="left", padx=8)
+
+        self.refresh_controls()
+        self.poll()
+
+    def _menu(self, parent, row, text, variable, options, command):
+        Label(parent, text=text + ":", anchor="w").grid(row=row, column=0, sticky="w", padx=4)
+        OptionMenu(parent, variable, *options, command=command).grid(row=row, column=1, sticky="w", padx=4)
+
+    def _scale(self, parent, row, text, low, high, resolution, command):
+        Label(parent, text=text + ":", anchor="w").grid(row=row, column=0, sticky="w", padx=4)
+        scale = tk.Scale(parent, from_=low, to=high, resolution=resolution, orient=tk.HORIZONTAL, length=170, command=command)
+        scale.grid(row=row, column=1, sticky="w", padx=4)
+        return scale
+
+    def send(self, action):
+        """Runs a camera command. Losing the port altogether is noticed by the main window."""
+        control = self.get_control()
+        if control is None:
+            return
+        try:
+            action(control)
+            self.message.config(text="")
+        except (OSError, BosonControlError) as e:
+            self.message.config(text=str(e))
+
+    def refresh_controls(self):
+        """Makes the widgets show the camera's current settings."""
+        def load(control):
+            control.wait_until_settled()
+            gain = control.get_setting('gain')
+            self.gain_var.set(next((name for name, value in BosonControl.GAIN_MODES.items() if value == gain), f"Other ({gain})"))
+            self.linear_scale.set(control.get_setting('agc_linear'))
+            self.max_gain_scale.set(control.get_setting('agc_max_gain'))
+            self.zoom_scale.config(to=control.read(BosonControl.GET_MAX_ZOOM, 'I'))
+            self.zoom_scale.set(control.get_setting('zoom')[0])
+            for name, variable in self.setting_vars.items():
+                variable.set(control.get_setting(name))
+            self.time_threshold = control.read(BosonControl.GET_FFC_TIME_THRESHOLD, 'I')
+            self.temp_threshold = control.read(BosonControl.GET_FFC_TEMP_THRESHOLD, 'H') / 10.0
+        self.send(load)
+
+    def set_gain(self, name):
+        def action(control):
+            control.set_setting('gain', BosonControl.GAIN_MODES[name])
+            control.run_ffc() # The picture is badly miscalibrated after a gain change until the next FFC
+        self.send(action)
+
+    def set_zoom(self, value):
+        def action(control):
+            _, x_center, y_center = control.get_setting('zoom')
+            control.set_setting('zoom', int(value), x_center, y_center)
+        self.send(action)
+
+    def set_region(self, setting, region):
+        def action(control):
+            first_row, last_row, first_column, last_column = control.saved_settings[setting]
+            if region == "Centre":
+                rows, columns = last_row - first_row + 1, last_column - first_column + 1
+                first_row, last_row = first_row + rows * 2 // 5, first_row + rows * 3 // 5 - 1
+                first_column, last_column = first_column + columns * 2 // 5, first_column + columns * 3 // 5 - 1
+            control.set_setting(setting, first_row, last_row, first_column, last_column)
+        self.send(action)
+
+    def reset(self):
+        def action(control):
+            control.restore_settings()
+        self.send(action)
+        self.contrast_region_var.set("Whole picture")
+        self.readout_region_var.set("Whole picture")
+        self.refresh_controls()
+
+    def _read_levels(self, control):
+        if self.readout_region_var.get() == "Centre":
+            ids = (BosonControl.GET_STATS_FIRST_IN_ROI, BosonControl.GET_STATS_LAST_IN_ROI, BosonControl.GET_STATS_MEAN_IN_ROI)
+        else:
+            ids = (BosonControl.GET_STATS_FIRST, BosonControl.GET_STATS_LAST, BosonControl.GET_STATS_MEAN)
+        return " / ".join(str(control.read(function_id, 'H')) for function_id in ids)
+
+    def _read_time_since_calibration(self, control):
+        now = time.time()
+        frame = control.read(BosonControl.GET_FRAME_COUNT, 'I')
+        if self.first_frame_sample is None:
+            self.first_frame_sample = (now, frame)
+        first_time, first_frame = self.first_frame_sample
+        if now - first_time < 1:
+            return "measuring..."
+        frames_per_second = (frame - first_frame) / (now - first_time)
+        seconds = (frame - control.read(BosonControl.GET_LAST_FFC_FRAME, 'I')) / frames_per_second
+        return f"{seconds:.0f} s (recommended at {self.time_threshold} s)"
+
+    def _read_temperature_change(self, control):
+        change = (control.read(BosonControl.GET_SENSOR_TEMP, 'H') - control.read(BosonControl.GET_LAST_FFC_TEMP, 'H')) / 10.0
+        return f"{change:+.1f} °C (recommended at {self.temp_threshold:.1f} °C)"
+
+    def poll(self):
+        if self.closed:
+            return
+        control = self.get_control()
+        if control is None:
+            self.close()
+            return
+        readers = {
+            "Sensor temperature": lambda: f"{control.read(BosonControl.GET_SENSOR_TEMP, 'H') / 10.0 - 273.15:.1f} °C",
+            "Core temperature": lambda: f"{control.read(BosonControl.GET_CORE_TEMP, 'f'):.1f} °C",
+            "Overheat events": lambda: str(control.read(BosonControl.GET_OVER_TEMP_COUNT, 'I')),
+            "Time since calibration": lambda: self._read_time_since_calibration(control),
+            "Temperature change since calibration": lambda: self._read_temperature_change(control),
+            "Picture levels (low / high / mean)": lambda: self._read_levels(control),
+            "Motion count": lambda: f"{control.read(BosonControl.GET_MOTION_COUNT, 'I')} (threshold {control.read(BosonControl.GET_MOTION_THRESHOLD, 'I')})",
+        }
+        for name, reader in readers.items():
+            try:
+                self.readouts[name].config(text=reader())
+            except BosonControlError:
+                self.readouts[name].config(text="not available")
+            except OSError:
+                self.close() # The main window reports the lost port
+                return
+        self.window.after(self.POLL_MS, self.poll)
+
+    def close(self):
+        self.closed = True
+        self.window.destroy()
 
 
 def rotated_size(frame_width, frame_height, rotation):
@@ -932,6 +1189,7 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
     capture_thread = None            # << Initialize here
     desired_capture_fps = 15         # Default, will be updated based on camera
     boson_control = None             # Serial control of the current camera, if it's a Boson
+    settings_window = None
 
     # Variables local to main, potentially modified by nested switch_camera via nonlocal
     # or passed to lambdas that capture their current state.
@@ -1040,6 +1298,7 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
         nonlocal boson_control
         boson_control = None
         calibrate_button.config(state=tk.DISABLED)
+        settings_button.config(state=tk.DISABLED)
         calibration_label.config(text="", fg="black")
         if camera_type != 'BOSON':
             return
@@ -1054,6 +1313,7 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
             calibration_label.config(text="Periodic calibration on (no control port)", fg="orange")
         else:
             calibrate_button.config(state=tk.NORMAL)
+            settings_button.config(state=tk.NORMAL)
             calibration_label.config(text="Periodic calibration off", fg="green")
 
     def lost_calibration_control(error):
@@ -1062,6 +1322,7 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
         stop_manual_calibration(boson_control)
         boson_control = None
         calibrate_button.config(state=tk.DISABLED)
+        settings_button.config(state=tk.DISABLED)
         calibration_label.config(text="Calibration control lost", fg="red")
 
     def calibrate_now():
@@ -1072,6 +1333,13 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
             calibration_label.config(text="Periodic calibration off", fg="green")
         except (OSError, BosonControlError) as e:
             lost_calibration_control(e)
+
+    def open_settings_window():
+        nonlocal settings_window
+        if settings_window is not None and not settings_window.closed:
+            settings_window.window.lift()
+        elif boson_control is not None:
+            settings_window = CameraSettingsWindow(root, lambda: boson_control)
 
     def show_calibration_state():
         if boson_control is not None:
@@ -1312,6 +1580,8 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
     Button(action_button_frame, text="Exit Program", command=lambda: exit_program(cap, out_var)).pack(side="left", padx=5)
     calibrate_button = Button(action_button_frame, text="Calibrate", command=calibrate_now, state=tk.DISABLED)
     calibrate_button.pack(side="left", padx=5)
+    settings_button = Button(action_button_frame, text="Camera Settings", command=open_settings_window, state=tk.DISABLED)
+    settings_button.pack(side="left", padx=5)
     calibration_label = Label(action_button_frame, text="")
     calibration_label.pack(side="left", padx=5)
 
