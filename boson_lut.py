@@ -100,6 +100,7 @@ frame_queue = queue.Queue(maxsize=1) # Queue to safely pass frames to the main t
 
 current_camera_type = None # Variable to store the current camera type string (e.g., 'BOSON')
 current_display_delay_ms = 100 # Default to 100ms (10 FPS) initially
+recording_frame_size = None # (width, height) of the video being recorded; guarded by recording_lock
 
 # Helper Functions
 
@@ -162,6 +163,11 @@ def get_video_devices_for_flir():
         for device in devices_to_process:
             processed_any_device_in_loop = True
             if DEBUG_MODE: print(f"DEBUG: Processing V4L device: {device.device_node}")
+            # UVC cameras also expose a metadata node, which can't deliver video frames
+            capabilities = device.properties.get('ID_V4L_CAPABILITIES')
+            if capabilities is not None and ':capture:' not in capabilities:
+                if DEBUG_MODE: print(f"DEBUG:   Device {device.device_node} can't capture video. Skipping.")
+                continue
             parent = device.find_parent(subsystem='usb', device_type='usb_device')
             if parent is None:
                 if DEBUG_MODE: print(f"DEBUG:   Device {device.device_node} has no USB parent. Skipping.")
@@ -172,15 +178,17 @@ def get_video_devices_for_flir():
             model = parent.properties.get('ID_MODEL', 'Unknown Model') # Default if not present
             device_node = device.device_node 
 
-            camera_type_str = 'Unknown'
-            # logic to determine camera_type_str based on vendor_id, product_id, model
+            # Only thermal cameras are listed; anything else (e.g. a webcam) is skipped
             if vendor_id == FLIR_VENDOR_ID:
-                if 'Boson' in model: camera_type_str = 'BOSON'
+                camera_type_str = 'BOSON' if 'Boson' in model else 'Unknown'
                 # Add other FLIR models if needed
             elif vendor_id == '1e4e' and product_id == LEPTON_PRODUCT_ID: # GroupGets PureThermal, common for Lepton
-                camera_type_str = 'LEPTON3' 
+                camera_type_str = 'LEPTON3'
             elif vendor_id == AMPBANK_VENDOR_ID and product_id == AMPBANK_PRODUCT_ID:
                 camera_type_str = 'AMPBANK'
+            else:
+                if DEBUG_MODE: print(f"DEBUG:   Device {device_node} ({model}) is not a known thermal camera. Skipping.")
+                continue
 
             if DEBUG_MODE: print(f"DEBUG:   Potential thermal camera: Model: '{model}', Device: {device_node}, VendorID: {vendor_id}, ProductID: {product_id}, Identified Type: {camera_type_str}")
             flir_devices.append({'device_node': device_node, 'camera_type': camera_type_str, 'model': model})
@@ -209,6 +217,18 @@ def get_video_devices_for_flir():
         if DEBUG_MODE: print(f"DEBUG: Identified {len(flir_devices)} thermal camera(s) to be returned.")
     if DEBUG_MODE: print("DEBUG: Exiting get_video_devices_for_flir.")
     return flir_devices
+
+
+def apply_camera_type_override(cameras, camera_type):
+    """Relabels the cameras --camera_type could describe. USB IDs can't tell a Lepton 2 from a Lepton 3."""
+    family = lambda name: 'LEPTON' if name.startswith('LEPTON') else name
+    matches = [cam for cam in cameras if cam['camera_type'] == 'Unknown' or family(cam['camera_type']) == family(camera_type)]
+    if not matches:
+        detected = ', '.join(cam['camera_type'] for cam in cameras)
+        print(f"Warning: no detected camera looks like {camera_type} (found {detected}). Treating them all as {camera_type}.")
+        matches = cameras
+    for cam in matches:
+        cam['camera_type'] = camera_type
 
 
 def create_custom_lut(color, color_gradient_step):
@@ -437,7 +457,7 @@ def capture_and_process_video(cap, lut_var, recording_var, out_var, frame_width,
         with recording_lock: 
             if recording_var[0] and out_var[0] is not None:
                 try:
-                    out_var[0].write(colored_bgr_frame) # Video writers usually expect BGR
+                    out_var[0].write(fit_frame_to_size(colored_bgr_frame, *recording_frame_size)) # Video writers usually expect BGR
                 except Exception as e_write:
                     print(f"Error writing frame to video: {e_write}")
                     print("Stopping recording due to writing error.")
@@ -497,12 +517,36 @@ def take_screenshot():
         screenshot_requested = True
 
 
+def rotated_size(frame_width, frame_height, rotation):
+    """Returns the (width, height) a frame has after the selected rotation."""
+    if rotation in ("90", "270"):
+        return frame_height, frame_width
+    return frame_width, frame_height
+
+
+def fit_frame_to_size(frame, width, height):
+    """Letterboxes a frame to width x height. A video writer silently drops frames of any other size,
+    which would otherwise happen when the rotation or camera changes during a recording."""
+    frame_height, frame_width = frame.shape[:2]
+    if (frame_width, frame_height) == (width, height):
+        return frame
+    scale = min(width / frame_width, height / frame_height)
+    new_width = max(1, round(frame_width * scale))
+    new_height = max(1, round(frame_height * scale))
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    left = (width - new_width) // 2
+    top = (height - new_height) // 2
+    canvas[top:top + new_height, left:left + new_width] = cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    return canvas
+
+
 # Modify the toggle_recording function definition
-def toggle_recording(recording_var, out_var, record_button_widget, original_button_bg, 
-                     frame_width, frame_height, 
+def toggle_recording(recording_var, out_var, record_button_widget, original_button_bg,
+                     frame_width, frame_height,
                      current_desired_capture_fps, # <<< New parameter
                      root):
     """Starts or stops recording and changes the record button color."""
+    global recording_frame_size
     with recording_lock: # Assuming recording_lock is a global threading.Lock
         if not recording_var[0]:
             # Start recording
@@ -531,6 +575,7 @@ def toggle_recording(recording_var, out_var, record_button_widget, original_butt
                 out_var[0] = None 
                 return recording_var[0], out_var[0]
             
+            recording_frame_size = (frame_width, frame_height)
             recording_var[0] = True
             print(f"Started recording to {output_file}")
             if root and record_button_widget:
@@ -712,7 +757,7 @@ def open_camera(device_node, camera_type):
     return cap, frame_width, frame_height
 
 
-def main(initial_lut_name, initial_camera_type_hint='BOSON'):
+def main(initial_lut_name=None, initial_camera_type_hint=None):
     global root # For Tkinter root, current VideoCapture, and current capture thread
     global current_camera_type, current_display_delay_ms # Module-level globals
     
@@ -741,7 +786,8 @@ def main(initial_lut_name, initial_camera_type_hint='BOSON'):
 
     if DEBUG_MODE: print("DEBUG: Loading configuration...")
     config = load_config()
-    initial_preferred_lut = config.get('lut_name', initial_lut_name)
+    # A LUT named on the command line wins over the saved one
+    initial_preferred_lut = initial_lut_name or config.get('lut_name', 'WHITEHOT')
     initial_camera_device_node_from_config = config.get('camera_device', None)
     initial_flip_state = config.get('flip_state', 'None')
     initial_rotate_state = config.get('rotate_state', '0')
@@ -756,17 +802,21 @@ def main(initial_lut_name, initial_camera_type_hint='BOSON'):
         messagebox.showerror("Camera Error", "No thermal cameras detected. The application will now exit.")
         return
 
+    if initial_camera_type_hint:
+        apply_camera_type_override(available_camera_info_list, initial_camera_type_hint)
+
     # Camera Selection Logic (prioritizing Boson for testing as per last logs)
     default_camera_info = None
     if DEBUG_MODE: print(f"DEBUG MAIN: Starting camera selection. Configured device node: {initial_camera_device_node_from_config}")
     if DEBUG_MODE: print(f"DEBUG MAIN: CAMERA_RESOLUTIONS dictionary keys available: {list(CAMERA_RESOLUTIONS.keys())}")
 
     # Test prioritization (e.g., for Boson) - can be removed for normal operation
-    if DEBUG_MODE: print("DEBUG MAIN: Attempting to prioritize BOSON for initial startup...")
+    prioritized_type = initial_camera_type_hint or 'BOSON'
+    if DEBUG_MODE: print(f"DEBUG MAIN: Attempting to prioritize {prioritized_type} for initial startup...")
     for cam_info_iter in available_camera_info_list:
-        if cam_info_iter.get('camera_type') == 'BOSON':
+        if cam_info_iter.get('camera_type') == prioritized_type:
             default_camera_info = cam_info_iter
-            if DEBUG_MODE: print(f"DEBUG MAIN: Prioritized and selected BOSON: {default_camera_info}")
+            if DEBUG_MODE: print(f"DEBUG MAIN: Prioritized and selected {prioritized_type}: {default_camera_info}")
             break
     
     if default_camera_info:
@@ -1004,7 +1054,7 @@ def main(initial_lut_name, initial_camera_type_hint='BOSON'):
              original_button_bg = "SystemButtonFace" 
     record_button.config(command=lambda: toggle_recording(
         recording_var, out_var, record_button, original_button_bg,
-        frame_width, frame_height, desired_capture_fps, # Pass current values from main's scope
+        *rotated_size(frame_width, frame_height, rotate_var.get()), desired_capture_fps, # Pass current values from main's scope
         root
     ))
     record_button.pack(side="left", padx=5)
@@ -1118,14 +1168,15 @@ if __name__ == "__main__":
     load_custom_luts()
     if DEBUG_MODE: print("DEBUG: Returned from load_custom_luts() in __main__.")
     parser = argparse.ArgumentParser(description="Apply a false-color LUT to a video stream from a thermal camera.")
-    # lut_name argument still exists but will be overridden by config if available
-    parser.add_argument(
-        '--lut',
-        # choices=LUTS.keys(), # This might fail if LUTS isn't populated yet or if custom LUTs add too many
-        default='WHITEHOT',
-        help='Name of the initial LUT to apply.'
-    )
-    # Add any other arguments your script expects
+    lut_names = sorted(LUTS.keys())
+    lut_help = "Default: the LUT saved in the config file, otherwise WHITEHOT. Available: " + ", ".join(lut_names) + "."
+    lut_group = parser.add_mutually_exclusive_group()
+    lut_group.add_argument('lut_name', nargs='?', choices=lut_names, metavar='LUT',
+                           help="Name of the initial LUT to apply. " + lut_help)
+    lut_group.add_argument('--lut', choices=lut_names, metavar='LUT',
+                           help="Same as the positional LUT argument.")
+    parser.add_argument('--camera_type', choices=sorted(CAMERA_RESOLUTIONS.keys()),
+                        help="Type of camera being used. Default: detected from the USB IDs (a Lepton is assumed to be a LEPTON3).")
 
     if DEBUG_MODE: print("DEBUG: About to parse arguments.")
     try:
@@ -1138,10 +1189,7 @@ if __name__ == "__main__":
 
     if DEBUG_MODE: print("DEBUG: About to call main() function.")
     try:
-        # Ensure the argument name here matches what your main() function expects.
-        # The original main() was: main(initial_lut_name, initial_camera_type_hint='BOSON')
-        # So, you'd pass args.lut to initial_lut_name.
-        main(initial_lut_name=args.lut) 
+        main(initial_lut_name=args.lut_name or args.lut, initial_camera_type_hint=args.camera_type)
         if DEBUG_MODE: print("DEBUG: Returned from main() function normally.")
     except Exception as e:
         if DEBUG_MODE: print(f"DEBUG: An error occurred during main() execution: {e}")

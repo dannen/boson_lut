@@ -29,27 +29,36 @@ Note: `tkinter` is usually included with the standard Python installation.
 The script can be run from the command line and provides various command line options to customize the behavior. Below are the available options.
 
 ### Command Line Options
-- `lut_name` (positional argument): The name of the LUT to apply. Available options include:
-  - `WHITEHOT`, `BLACKHOT`, `REDHOT`, `RAINBOW`, `OCEAN`, `LAVA`, `ARCTIC`, `GLOBOW`, `GRADEDFIRE`, `INSTALERT`, `SPRING`, `SUMMER`, `COOL`, `HSV`, `PINK`, `HOT`, `MAGMA`, `INFERNO`, `PLASMA`, `VIRIDIS`, `CIVIDIS`, `ISOTHERM_RED`, `ISOTHERM_GREEN`, `ISOTHERM_BLUE`.
-  - Default value: `REDHOT`.
-- `--camera_type` (optional argument): The type of camera being used. Options include:
-  - `BOSON`, `LEPTON3`, `LEPTON2`.
-  - Default value: `BOSON`.
+- `LUT` (optional positional argument, or `--lut LUT`): The LUT to start with. Use one or the other, not both.
+  - Built-in options: `ARCTIC`, `BLACKHOT`, `BONE`, `CIVIDIS`, `COOL`, `GLOBOW`, `GRADEDFIRE`, `HOT`, `HSV`, `INFERNO`, `INSTALERT`, `ISOTHERM_BLUE`, `ISOTHERM_GREEN`, `ISOTHERM_RED`, `LAVA`, `MAGMA`, `OCEAN`, `PINK`, `PLASMA`, `RAINBOW`, `SPRING`, `SUMMER`, `VIRIDIS`, `WHITEHOT`.
+  - Any `.lut` file in the current directory is also available, under its file name without the extension. `--help` lists everything it found.
+  - Default: the LUT saved with **Save Config**, otherwise `WHITEHOT`. A LUT named on the command line wins over the saved one.
+- `--camera_type` (optional argument): The type of camera being used: `BOSON`, `LEPTON3`, `LEPTON2` or `AMPBANK`.
+  - Default: detected from the camera's USB IDs. Those can't tell a Lepton 2 from a Lepton 3, so a Lepton is treated as a `LEPTON3` unless you pass `--camera_type LEPTON2`.
+  - If several cameras are attached, the one of this type is opened first.
 
 ### Example Usage
 ```sh
-python boson_lut.py REDHOT --camera_type BOSON
+python boson_lut.py ironblack
 ```
-This command runs the script, applies the `REDHOT` LUT, and uses the `BOSON` camera type.
+This command starts with the `ironblack` LUT and detects the camera type.
+
+```sh
+python boson_lut.py --lut RAINBOW --camera_type LEPTON2
+```
+This command starts with the `RAINBOW` LUT and treats the Lepton as a Lepton 2.
 
 ## Features
-- **Thermal Camera Detection**: Automatically detects connected FLIR cameras using `pyudev`.
+- **Thermal Camera Detection**: Automatically detects connected FLIR Boson, FLIR Lepton and Ampbank cameras using `pyudev`. Other video devices, such as webcams, are not listed.
 - **GUI Controls**: A GUI interface using Tkinter allows users to:
   - Select different LUTs.
   - Switch between detected cameras.
-  - Start or stop video recording.
+  - Flip and rotate the picture.
+  - Start or stop video recording, and take screenshots. Both are saved in the current directory.
+  - Save the current LUT, camera, flip and rotation to `thermal_config.json` in the current directory.
   - Exit the application.
-- **Custom LUTs**: The script also allows the application of custom LUTs, such as `ISOTHERM_RED`, `ISOTHERM_GREEN`, and `ISOTHERM_BLUE`.
+- **Recording**: A recording keeps the size the picture had when it started. If the rotation or camera changes during a recording, the picture is scaled to fit that size, with black bars.
+- **Custom LUTs**: Besides the isotherm LUTs (`ISOTHERM_RED`, `ISOTHERM_GREEN` and `ISOTHERM_BLUE`), the script loads `.lut` files from the current directory. Each file holds a list of 256 `(B, G, R)` tuples.
 
 ## Set USB Permissions
 We faced an issue with the application not having permission to access the FLIR Boson USB device. To resolve this, we updated udev rules:
