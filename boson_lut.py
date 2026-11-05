@@ -12,6 +12,10 @@ import threading
 import time
 import ast
 import queue  # Import queue for safe Tkinter updates
+import select
+import struct
+import termios
+import tty
 import json # Import json for configuration saving/loading
 import traceback # For detailed error logging
 # Add traceback for debugging errors within Tkinter callbacks
@@ -517,6 +521,158 @@ def take_screenshot():
         screenshot_requested = True
 
 
+class BosonControlError(Exception):
+    """The Boson rejected a command or sent a reply that can't be used."""
+
+
+class BosonControl:
+    """Talks to a Boson's USB serial control port (FLIR's FSLP framing and binary protocol)."""
+    FFC_MANUAL = 0
+    FFC_AUTO = 1
+    RUN_FFC = 0x00050007
+    SET_FFC_MODE = 0x00050012
+    GET_FFC_MODE = 0x00050013
+    GET_FFC_DESIRED = 0x00050055
+    STUFFED_BYTES = {0x8E: b'\x9E\x81', 0x9E: b'\x9E\x91', 0xAE: b'\x9E\xA1'}
+    UNSTUFFED_BYTES = {0x81: 0x8E, 0x91: 0x9E, 0xA1: 0xAE}
+
+    def __init__(self, port):
+        self.sequence = 0
+        self.previous_ffc_mode = None
+        self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            tty.setraw(self.fd)
+            attributes = termios.tcgetattr(self.fd)
+            attributes[4] = attributes[5] = termios.B921600
+            termios.tcsetattr(self.fd, termios.TCSANOW, attributes)
+        except Exception:
+            self.close()
+            raise
+
+    @staticmethod
+    def _crc16(data):
+        crc = 0x1D0F
+        for byte in data:
+            crc ^= byte << 8
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+        return crc
+
+    @classmethod
+    def _packet(cls, sequence, function_id, data=b''):
+        body = b'\x00' + struct.pack('>III', sequence, function_id, 0xFFFFFFFF) + data
+        body += struct.pack('>H', cls._crc16(body))
+        stuffed = b''.join(cls.STUFFED_BYTES.get(byte, bytes([byte])) for byte in body)
+        return b'\x8E' + stuffed + b'\xAE'
+
+    @classmethod
+    def _parse_reply(cls, frame):
+        """Returns (sequence, function id, status, data) from the bytes between the start and end flags."""
+        body = bytearray()
+        escaped = False
+        for byte in frame:
+            if escaped:
+                if byte not in cls.UNSTUFFED_BYTES:
+                    raise BosonControlError("Bad escape sequence in reply")
+                body.append(cls.UNSTUFFED_BYTES[byte])
+                escaped = False
+            elif byte == 0x9E:
+                escaped = True
+            else:
+                body.append(byte)
+        if len(body) < 15 or cls._crc16(body[:-2]) != struct.unpack('>H', body[-2:])[0]:
+            raise BosonControlError("Bad checksum or length in reply")
+        return struct.unpack('>III', body[1:13]) + (bytes(body[13:-2]),)
+
+    def _call(self, function_id, data=b'', timeout=0.5):
+        self.sequence = (self.sequence + 1) & 0xFFFFFFFF
+        termios.tcflush(self.fd, termios.TCIFLUSH)
+        os.write(self.fd, self._packet(self.sequence, function_id, data))
+        received = b''
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if not select.select([self.fd], [], [], 0.05)[0]:
+                continue
+            received += os.read(self.fd, 4096)
+            start = received.find(b'\x8E')
+            end = received.find(b'\xAE', start + 1) if start >= 0 else -1
+            if end < 0:
+                continue
+            sequence, reply_id, status, reply = self._parse_reply(received[start + 1:end])
+            received = received[end + 1:]
+            if sequence != self.sequence or reply_id != function_id:
+                continue
+            if status != 0:
+                raise BosonControlError(f"Command {function_id:#010x} failed with status {status}")
+            return reply
+        raise TimeoutError(f"No reply to command {function_id:#010x}")
+
+    def _read_uint32(self, function_id):
+        reply = self._call(function_id)
+        if len(reply) != 4:
+            raise BosonControlError(f"Unexpected reply length from command {function_id:#010x}")
+        return struct.unpack('>I', reply)[0]
+
+    def get_ffc_mode(self):
+        return self._read_uint32(self.GET_FFC_MODE)
+
+    def set_ffc_mode(self, mode):
+        self._call(self.SET_FFC_MODE, struct.pack('>I', mode))
+
+    def run_ffc(self):
+        self._call(self.RUN_FFC)
+
+    def ffc_desired(self):
+        return self._read_uint32(self.GET_FFC_DESIRED) != 0
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def find_boson_control_port(video_device_node):
+    """Returns the serial port on the same USB device as a video node, or None."""
+    context = pyudev.Context()
+    video_device = pyudev.Devices.from_device_file(context, video_device_node)
+    usb_device = video_device.find_parent(subsystem='usb', device_type='usb_device')
+    if usb_device is None:
+        return None
+    for serial_device in context.list_devices(subsystem='tty'):
+        parent = serial_device.find_parent(subsystem='usb', device_type='usb_device')
+        if parent is not None and parent.device_path == usb_device.device_path:
+            return serial_device.device_node
+    return None
+
+
+def start_manual_calibration(video_device_node):
+    """Stops a Boson's periodic calibration and calibrates once. Returns its control, with the mode to restore."""
+    port = find_boson_control_port(video_device_node)
+    if port is None:
+        raise BosonControlError(f"No control port found for {video_device_node}")
+    control = BosonControl(port)
+    try:
+        control.previous_ffc_mode = control.get_ffc_mode()
+        control.set_ffc_mode(BosonControl.FFC_MANUAL)
+        control.run_ffc()
+    except Exception:
+        control.close()
+        raise
+    print(f"Boson calibrated on {port}; periodic calibration is off until the program exits.")
+    return control
+
+
+def stop_manual_calibration(control):
+    """Puts the camera back in the calibration mode it had and closes the port."""
+    try:
+        if control.previous_ffc_mode is not None:
+            control.set_ffc_mode(control.previous_ffc_mode)
+    except (OSError, BosonControlError) as e:
+        print(f"Warning: could not restore the Boson's calibration mode: {e}")
+    finally:
+        control.close()
+
+
 def rotated_size(frame_width, frame_height, rotation):
     """Returns the (width, height) a frame has after the selected rotation."""
     if rotation in ("90", "270"):
@@ -775,6 +931,7 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
     frame_height = 0                 # You likely already initialize this
     capture_thread = None            # << Initialize here
     desired_capture_fps = 15         # Default, will be updated based on camera
+    boson_control = None             # Serial control of the current camera, if it's a Boson
 
     # Variables local to main, potentially modified by nested switch_camera via nonlocal
     # or passed to lambdas that capture their current state.
@@ -878,9 +1035,56 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
     out_var = [None]
     recording_var = [False]
 
+    def take_control_of_calibration(device_node, camera_type):
+        """Applies to Boson cameras; on any failure the camera keeps calibrating by itself."""
+        nonlocal boson_control
+        boson_control = None
+        calibrate_button.config(state=tk.DISABLED)
+        calibration_label.config(text="", fg="black")
+        if camera_type != 'BOSON':
+            return
+        try:
+            boson_control = start_manual_calibration(device_node)
+        except PermissionError as e:
+            print(f"Warning: no permission for the Boson's control port, so it keeps calibrating periodically: {e}")
+            print("Add your user to the 'dialout' group, then log in again.")
+            calibration_label.config(text="Periodic calibration on (no permission for control port)", fg="orange")
+        except (OSError, BosonControlError, pyudev.DeviceNotFoundError) as e:
+            print(f"Warning: can't control the Boson, so it keeps calibrating periodically: {e}")
+            calibration_label.config(text="Periodic calibration on (no control port)", fg="orange")
+        else:
+            calibrate_button.config(state=tk.NORMAL)
+            calibration_label.config(text="Periodic calibration off", fg="green")
+
+    def lost_calibration_control(error):
+        nonlocal boson_control
+        print(f"Warning: lost contact with the Boson's control port: {error}")
+        stop_manual_calibration(boson_control)
+        boson_control = None
+        calibrate_button.config(state=tk.DISABLED)
+        calibration_label.config(text="Calibration control lost", fg="red")
+
+    def calibrate_now():
+        if boson_control is None:
+            return
+        try:
+            boson_control.run_ffc()
+            calibration_label.config(text="Periodic calibration off", fg="green")
+        except (OSError, BosonControlError) as e:
+            lost_calibration_control(e)
+
+    def show_calibration_state():
+        if boson_control is not None:
+            try:
+                if boson_control.ffc_desired():
+                    calibration_label.config(text="Camera recommends calibrating", fg="orange")
+            except (OSError, BosonControlError) as e:
+                lost_calibration_control(e)
+        root.after(2000, show_calibration_state)
+
     # Define switch_camera (nested function)
     def switch_camera(*args_trace):
-        nonlocal cap, current_camera_index_node, frame_width, frame_height, capture_thread, desired_capture_fps
+        nonlocal cap, current_camera_index_node, frame_width, frame_height, capture_thread, desired_capture_fps, boson_control
         global current_camera_type, capture_stop_event, camera_disconnected_event, frame_queue, cap_lock, current_display_delay_ms
 
         selected_camera_display_str = camera_var.get()
@@ -900,6 +1104,10 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
 
         if DEBUG_MODE: print(f"DEBUG SWITCH_CAMERA: Attempting to switch from '{current_camera_index_node}' to '{selected_device_node}'")
         if status_label: status_label.config(text=f"Switching to {selected_device_node}...", fg="orange")
+
+        if boson_control is not None:
+            stop_manual_calibration(boson_control)
+            boson_control = None
 
         old_thread_to_join = capture_thread 
         old_thread_name = old_thread_to_join.name if old_thread_to_join and hasattr(old_thread_to_join, 'name') else "UnknownOldThread"
@@ -962,6 +1170,7 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
         cap = new_cap_obj
         current_camera_index_node = selected_device_node 
         current_camera_type = new_cam_type_str
+        take_control_of_calibration(selected_device_node, current_camera_type)
         frame_width = new_frame_width   
         frame_height = new_frame_height 
         
@@ -1101,6 +1310,10 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
         lut_var.get(), current_camera_index_node, flip_var.get(), rotate_var.get()
     )).pack(side="left", padx=5)
     Button(action_button_frame, text="Exit Program", command=lambda: exit_program(cap, out_var)).pack(side="left", padx=5)
+    calibrate_button = Button(action_button_frame, text="Calibrate", command=calibrate_now, state=tk.DISABLED)
+    calibrate_button.pack(side="left", padx=5)
+    calibration_label = Label(action_button_frame, text="")
+    calibration_label.pack(side="left", padx=5)
 
     # Status and Video Labels
     status_label = Label(root, text="Status: Initializing...", fg="black", anchor="w")
@@ -1109,6 +1322,9 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
     video_label.pack(padx=10, pady=10)
 
     if DEBUG_MODE: print("DEBUG: GUI elements configured.")
+
+    take_control_of_calibration(current_camera_index_node, current_camera_type)
+    show_calibration_state()
     
     initial_thread_name = f"CaptureThread-{current_camera_type}"
     if DEBUG_MODE: print(f"DEBUG MAIN: Preparing to start initial capture thread named: {initial_thread_name}")
@@ -1130,7 +1346,12 @@ def main(initial_lut_name=None, initial_camera_type_hint=None):
     root.protocol("WM_DELETE_WINDOW", lambda: exit_program(cap, out_var))
 
     if DEBUG_MODE: print("DEBUG: Starting Tkinter mainloop...")
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        if boson_control is not None:
+            stop_manual_calibration(boson_control)
+            boson_control = None
     if DEBUG_MODE: print("DEBUG: Tkinter mainloop exited.")
 
     # Final cleanup

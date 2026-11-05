@@ -55,9 +55,11 @@ This command starts with the `RAINBOW` LUT and treats the Lepton as a Lepton 2.
   - Switch between detected cameras.
   - Flip and rotate the picture.
   - Start or stop video recording, and take screenshots. Both are saved in the current directory.
+  - Calibrate a Boson on demand.
   - Save the current LUT, camera, flip and rotation to `thermal_config.json` in the current directory.
   - Exit the application.
 - **Recording**: A recording keeps the size the picture had when it started. If the rotation or camera changes during a recording, the picture is scaled to fit that size, with black bars.
+- **Boson Calibration**: By default a Boson recalibrates itself periodically (flat field correction, or FFC), which freezes the picture for about 0.4 seconds and shifts its brightness, including in recordings. While this program runs, it turns that off, calibrates once at startup, and leaves further calibrations to the **Calibrate** button. A message appears when the camera recommends calibrating, which it does once its temperature or time threshold is reached. The picture can degrade if you don't. On exit, the camera goes back to the mode it was in, and the setting is never saved to the camera's flash. Calibrating during a recording shows up in the video.
 - **Custom LUTs**: Besides the isotherm LUTs (`ISOTHERM_RED`, `ISOTHERM_GREEN` and `ISOTHERM_BLUE`), the script loads `.lut` files from the current directory. Each file holds a list of 256 `(B, G, R)` tuples.
 
 ## Set USB Permissions
@@ -89,6 +91,13 @@ We faced an issue with the application not having permission to access the FLIR 
    ```bash
    sudo udevadm trigger /dev/bus/usb/*
    ```
+
+## Serial Port Permissions
+Calibration control uses the Boson's USB serial port (usually `/dev/ttyACM0`), which normally requires membership of the `dialout` group:
+```bash
+sudo usermod -aG dialout $USER
+```
+Log in again afterwards. Without access, the program still runs, and the camera keeps calibrating periodically.
 
 ## Notes
 - Ensure that your system has access to the appropriate video devices, and that you have permissions to access them.
